@@ -1,0 +1,189 @@
+# Civic Pulse — Digital Governance & Public Information
+# Multi-Container Orchestration (PostgreSQL 16 + PostGIS + pgvector, Redis 7, MinIO S3, FastAPI, Celery)
+#
+# Quickstart Usage:
+# 1. Standalone Core Infrastructure (Postgres, Redis, MinIO):
+#    docker compose up -d postgres redis minio minio-init
+#    or simply:
+#    docker compose up -d
+#
+# 2. Full Application Stack (Infra + FastAPI API + Celery Worker):
+#    docker compose --profile app up -d
+
+services:
+  # ==========================================
+  # PostgreSQL 16 + PostGIS 3.4 + pgvector 0.7
+  # ==========================================
+  postgres:
+    image: civicpulse-postgres:16-postgis-pgvector
+    container_name: civicpulse-postgres
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM postgis/postgis:16-3.4
+        RUN apt-get update && \
+            apt-get install -y --no-install-recommends postgresql-16-pgvector && \
+            rm -rf /var/lib/apt/lists/*
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-civicpulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicpulse_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-civicpulse_db}
+    volumes:
+      - ./infra/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/01-init-extensions.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civicpulse} -d ${POSTGRES_DB:-civicpulse_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - civicpulse-network
+
+  # ==========================================
+  # Redis 7 (Caching, Rate Limiting, Celery Broker)
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: civicpulse-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - civicpulse-network
+
+  # ==========================================
+  # MinIO S3 Object Storage (Media, Evidence, Documents)
+  # ==========================================
+  minio:
+    image: minio/minio:latest
+    container_name: civicpulse-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin_secret}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - civicpulse-network
+
+  # MinIO Automated Bucket Initializer
+  minio-init:
+    image: minio/mc:latest
+    container_name: civicpulse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 ${S3_ACCESS_KEY:-minioadmin} ${S3_SECRET_KEY:-minioadmin_secret};
+      /usr/bin/mc mb --ignore-existing local/${S3_BUCKET_NAME:-civicpulse-media};
+      /usr/bin/mc anonymous set download local/${S3_BUCKET_NAME:-civicpulse-media};
+      exit 0;
+      "
+    restart: "no"
+    networks:
+      - civicpulse-network
+
+  # =======================================================
+  # Civic Pulse FastAPI Backend (Profile: "app" / "full")
+  # =======================================================
+  api:
+    image: civicpulse-server:latest
+    container_name: civicpulse-api
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    profiles:
+      - app
+      - full
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-civicpulse}:${POSTGRES_PASSWORD:-civicpulse_secret}@postgres:5432/${POSTGRES_DB:-civicpulse_db}
+      - SYNC_DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-civicpulse}:${POSTGRES_PASSWORD:-civicpulse_secret}@postgres:5432/${POSTGRES_DB:-civicpulse_db}
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+    volumes:
+      - ./server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - civicpulse-network
+
+  # =======================================================
+  # Civic Pulse Celery Worker (Profile: "app" / "full")
+  # =======================================================
+  worker:
+    image: civicpulse-server:latest
+    container_name: civicpulse-worker
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    profiles:
+      - app
+      - full
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-civicpulse}:${POSTGRES_PASSWORD:-civicpulse_secret}@postgres:5432/${POSTGRES_DB:-civicpulse_db}
+      - SYNC_DATABASE_URL=postgresql+psycopg2://${POSTGRES_USER:-civicpulse}:${POSTGRES_PASSWORD:-civicpulse_secret}@postgres:5432/${POSTGRES_DB:-civicpulse_db}
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+    volumes:
+      - ./server:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - civicpulse-network
+
+volumes:
+  postgres_data:
+    name: civicpulse_postgres_data
+  redis_data:
+    name: civicpulse_redis_data
+  minio_data:
+    name: civicpulse_minio_data
+
+networks:
+  civicpulse-network:
+    name: civicpulse-network
+    driver: bridge
