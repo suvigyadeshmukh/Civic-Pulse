@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply min-h-screen bg-civic-parchment font-sans text-civic-ink antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    @apply bg-civic-tealLight/30 text-civic-ink;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-civic-teal ring-offset-2 ring-offset-civic-parchment;
+  }
+}
+
+@layer components {
+  .container-page {
+    @apply mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8;
+  }
+
+  .surface {
+    @apply rounded-2xl border border-slate-200/80 bg-white shadow-soft;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-civic-ink px-5 py-3 text-sm font-semibold text-white transition-colors hover:bg-civic-inkLight disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-3 text-sm font-semibold text-civic-ink transition-colors hover:border-civic-teal/40 hover:bg-civic-mist disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white/80 px-2.5 py-1 text-[11px] font-semibold text-slate-600;
+  }
+
+  .label-caps {
+    @apply text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* React-Leaflet needs an explicit height on its container, and should never
+   sit above the sticky application header. Domain maps own their sizing. */
+.leaflet-container {
+  z-index: 0;
+  font-family: inherit;
+  background: #eef2f6;
+}
