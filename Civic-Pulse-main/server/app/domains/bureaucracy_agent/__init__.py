@@ -1,1 +1,0 @@
-"""Autonomous bureaucracy agent domain."""

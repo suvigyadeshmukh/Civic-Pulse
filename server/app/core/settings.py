@@ -14,10 +14,10 @@ from typing import Any
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# The canonical ``.env`` lives at the workspace root (``civic-pulse-workspace/.env``),
-# while this module sits at ``<workspace>/server/app/core/settings.py``.
-_WORKSPACE_DIR = Path(__file__).resolve().parents[2]
-_SERVER_DIR = Path(__file__).resolve().parents[1]
+# The canonical ``.env`` lives at the repository root, while this module sits at
+# ``<repo>/server/app/core/settings.py``.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SERVER_DIR = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=[
-            str(_WORKSPACE_DIR / ".env"),
-            str(_WORKSPACE_DIR / ".env.example"),
+            str(_REPO_ROOT / ".env"),
+            str(_REPO_ROOT / ".env.example"),
             str(_SERVER_DIR / ".env"),
         ],
         env_file_encoding="utf-8",
@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     BHASHINI_API_KEY: str = ""
     BHASHINI_USER_ID: str = ""
     BHASHINI_PIPELINE_ID: str = ""
+    HF_API_TOKEN: str = ""
+    AI4BHARAT_TRANSLATION_MODEL: str = "ai4bharat/indictrans2-en-indic-1B"
+    AI4BHARAT_TTS_MODEL: str = "ai4bharat/indic-parler-tts"
+    AI4BHARAT_ASR_MODEL: str = "ai4bharat/indic-conformer-600m-multilingual"
     GOOGLE_FACTCHECK_API_KEY: str = ""
 
     # ------------------------------------------------------------------
