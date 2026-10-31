@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -61,11 +61,14 @@ where = ["."]
 include = ["app*"]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-ra -q --asyncio-mode=auto"
-pythonpath = ["."]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
 python_files = ["test_*.py", "*_test.py"]
+markers = [
+    "integration: requires live PostgreSQL, Redis, or MinIO services",
+]
 
 [tool.ruff]
 line-length = 100

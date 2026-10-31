@@ -8,10 +8,16 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The canonical ``.env`` lives at the workspace root (``civic-pulse-workspace/.env``),
+# while this module sits at ``<workspace>/server/app/core/settings.py``.
+_WORKSPACE_DIR = Path(__file__).resolve().parents[2]
+_SERVER_DIR = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -22,7 +28,11 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=("../.env", ".env"),
+        env_file=[
+            str(_WORKSPACE_DIR / ".env"),
+            str(_WORKSPACE_DIR / ".env.example"),
+            str(_SERVER_DIR / ".env"),
+        ],
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -40,11 +50,13 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # PostgreSQL (async + sync engines)
     # ------------------------------------------------------------------
+    # Host port 5432 is reserved by the native Windows PostgreSQL 18 service,
+    # so the Docker PostgreSQL container is published on host port 5433.
     DATABASE_URL: str = (
-        "postgresql+asyncpg://civicpulse:civicpulse_secret@localhost:5432/civicpulse_db"
+        "postgresql+asyncpg://civicpulse:civicpulse_secret@localhost:5433/civicpulse_db"
     )
     SYNC_DATABASE_URL: str = (
-        "postgresql+psycopg2://civicpulse:civicpulse_secret@localhost:5432/civicpulse_db"
+        "postgresql+psycopg2://civicpulse:civicpulse_secret@localhost:5433/civicpulse_db"
     )
 
     # ------------------------------------------------------------------
@@ -93,15 +105,22 @@ class Settings(BaseSettings):
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def _parse_cors_origins(cls, v: Any) -> list[str]:
-        """Accept both a JSON array string and a native Python list."""
+        """Accept a JSON array string, a comma-separated string, or a Python list."""
         if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return []
             try:
-                parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    return [str(item) for item in parsed]
+                parsed = json.loads(value)
             except (json.JSONDecodeError, TypeError):
                 # Comma-separated fallback: "http://a,http://b"
-                return [origin.strip() for origin in v.split(",") if origin.strip()]
+                return [origin.strip() for origin in value.split(",") if origin.strip()]
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+            # Valid JSON but not an array (e.g. a bare string) — treat as CSV.
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(item) for item in v]
         return v  # type: ignore[return-value]
 
 

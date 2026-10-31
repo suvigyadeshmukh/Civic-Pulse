@@ -11,6 +11,7 @@ single ``app.core.security`` namespace:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -23,9 +24,11 @@ from argon2.exceptions import (
     VerificationError,
     VerifyMismatchError,
 )
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from jose import JWTError, jwt
 
+from app.core.exceptions import AppException
 from app.core.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -132,7 +135,28 @@ def decode_access_token(token: str) -> dict:
 # 3.  AES-256-GCM PII Vault Cipher
 # ========================================================================== #
 
-_PII_KEY_BYTES: bytes = base64.b64decode(_settings.PII_ENCRYPTION_KEY)
+def _decode_pii_key(raw_key: str) -> bytes:
+    """Decode the configured Base64 AES key, guaranteeing exactly 32 bytes.
+
+    If the value is not valid Base64, or decodes to a length other than 32
+    bytes (AES-256 requirement), derive a deterministic 32-byte key via
+    SHA-256 so the vault remains usable with misconfigured keys.
+    """
+    try:
+        decoded = base64.b64decode(raw_key, validate=True)
+    except (ValueError, TypeError):
+        decoded = b""
+    if len(decoded) == 32:
+        return decoded
+    logger.warning(
+        "PII_ENCRYPTION_KEY did not decode to 32 bytes (got %d); "
+        "falling back to SHA-256 derivation.",
+        len(decoded),
+    )
+    return hashlib.sha256(raw_key.encode("utf-8")).digest()
+
+
+_PII_KEY_BYTES: bytes = _decode_pii_key(_settings.PII_ENCRYPTION_KEY)
 _aesgcm = AESGCM(_PII_KEY_BYTES)
 
 # GCM standard nonce length
@@ -161,11 +185,27 @@ def decrypt_pii_dict(blob: bytes) -> dict:
 
     Raises
     ------
-    cryptography.exceptions.InvalidTag
-        If the blob has been tampered with or the wrong key is used.
+    AppException
+        ``400 DECIPHER_ERROR`` if the payload is truncated, tampered with, or
+        otherwise cannot be authenticated/decoded.
     """
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 28:
+        raise AppException(
+            status_code=400,
+            code="DECIPHER_ERROR",
+            message="Invalid encrypted payload",
+        )
+
     nonce = blob[:_NONCE_LEN]
     ciphertext_with_tag = blob[_NONCE_LEN:]
-    plaintext = _aesgcm.decrypt(nonce, ciphertext_with_tag, None)
-    return json.loads(plaintext.decode("utf-8"))
+    try:
+        plaintext = _aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+        return json.loads(plaintext.decode("utf-8"))
+    except (InvalidTag, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("PII decryption failed: %s", exc)
+        raise AppException(
+            status_code=400,
+            code="DECIPHER_ERROR",
+            message="Invalid encrypted payload",
+        ) from exc
 

@@ -16,13 +16,14 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
 
-from app.core.database import verify_db_connection_and_extensions
+from app.core.database import engine, verify_db_connection_and_extensions
 from app.core.exceptions import register_exception_handlers
 from app.core.pagination import ApiEnvelope
 from app.core.redis_bus import redis_client, redis_health_check
@@ -45,18 +46,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ---- Startup --------------------------------------------------------- #
     logger.info("Civic Pulse starting in '%s' mode …", settings.APP_ENV)
 
-    # 1. Verify PostgreSQL connectivity and required extensions
+    # 1. Verify PostgreSQL connectivity and required extensions. The probe
+    #    reports degraded state instead of raising, so a temporarily
+    #    unavailable database does not abort optional startup diagnostics.
     try:
         db_info = await verify_db_connection_and_extensions()
-        logger.info("Database verification: %s", db_info)
+        if db_info.get("database") == "connected":
+            logger.info("Database verification: %s", db_info)
+        else:
+            logger.warning("Database verification degraded: %s", db_info)
     except Exception:
         logger.exception("Database verification FAILED — aborting startup.")
         raise
 
-    # 2. Ensure S3 bucket and public-read policy exist
+    # 2. Ensure S3 bucket and public-read policy exist. When S3/MinIO is
+    #    unreachable, the service activates a local-disk fallback instead of
+    #    raising, so application startup never depends on object storage.
     try:
         await storage_service.ensure_bucket_exists()
-        logger.info("S3 storage ready — bucket '%s'.", settings.S3_BUCKET_NAME)
+        if storage_service.using_local_fallback:
+            logger.warning(
+                "S3 storage unavailable — using local disk fallback at '%s'.",
+                storage_service.local_root,
+            )
+        else:
+            logger.info("S3 storage ready — bucket '%s'.", settings.S3_BUCKET_NAME)
     except Exception:
         logger.exception("S3 bucket bootstrap FAILED — aborting startup.")
         raise
@@ -69,6 +83,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Civic Pulse shutting down …")
     await redis_client.aclose()
     logger.info("Redis connection closed.")
+    await engine.dispose()
+    logger.info("Database engine disposed.")
 
 
 # ========================================================================== #
@@ -135,6 +151,21 @@ register_exception_handlers(app)
 
 
 # ========================================================================== #
+# Local-disk media fallback
+# ========================================================================== #
+# When S3/MinIO is unreachable, StorageService writes uploads under
+# ``server/.local_storage/<bucket>/``. Expose that directory over HTTP so the
+# React SPA can still stream media in offline/development mode.
+_storage_root = storage_service.local_root
+_storage_root.mkdir(parents=True, exist_ok=True)
+app.mount(
+    "/local-media",
+    StaticFiles(directory=str(_storage_root)),
+    name="local-media",
+)
+
+
+# ========================================================================== #
 # Dynamic domain router mounting
 # ========================================================================== #
 
@@ -182,8 +213,9 @@ _DOMAIN_ROUTER_CONFIG: list[dict[str, str | list[str]]] = [
 def _mount_domain_routers(application: FastAPI) -> None:
     """Dynamically import and include each domain's ``APIRouter``.
 
-    Domains whose router module hasn't been implemented yet are silently
-    skipped so that the server boots cleanly during incremental development.
+    A failure in a single domain (missing module, import-time exception, or an
+    invalid/missing ``router`` attribute) is logged and skipped so that the
+    remaining domains still mount and the application can start.
     """
     for cfg in _DOMAIN_ROUTER_CONFIG:
         module_path = str(cfg["module"])
@@ -193,24 +225,40 @@ def _mount_domain_routers(application: FastAPI) -> None:
 
         try:
             mod = importlib.import_module(module_path)
-            router = getattr(mod, attr_name, None)
-            if router is None:
-                logger.debug(
-                    "Module '%s' loaded but has no attribute '%s'; skipping.",
-                    module_path,
-                    attr_name,
-                )
-                continue
-            application.include_router(router, prefix=prefix, tags=tags)  # type: ignore[arg-type]
-            logger.info("Mounted router: %s → %s", module_path, prefix)
-        except ImportError:
-            logger.debug("Domain router '%s' not available yet; skipping.", module_path)
-        except Exception:
+        except ModuleNotFoundError as exc:
             logger.warning(
-                "Failed to mount domain router '%s'; skipping.",
+                "Skipping router %s: module not found (%s).",
                 module_path,
-                exc_info=True,
+                exc,
             )
+            continue
+        except Exception:
+            logger.exception(
+                "Skipping router %s during application bootstrap.",
+                module_path,
+            )
+            continue
+
+        domain_router = getattr(mod, attr_name, None)
+        if not isinstance(domain_router, APIRouter):
+            logger.warning(
+                "Skipping router %s: missing or invalid APIRouter instance "
+                "(attribute '%s').",
+                module_path,
+                attr_name,
+            )
+            continue
+
+        try:
+            application.include_router(domain_router, prefix=prefix, tags=tags)
+        except Exception:
+            logger.exception(
+                "Skipping router %s during application bootstrap.",
+                module_path,
+            )
+            continue
+
+        logger.info("Successfully mounted router: %s → %s", module_path, prefix)
 
 
 _mount_domain_routers(app)
@@ -254,12 +302,25 @@ async def health_check() -> dict:
     db_status: dict
     try:
         db_info = await verify_db_connection_and_extensions()
-        db_status = {"status": "ok", **db_info}
+        db_status = {
+            "status": "ok" if db_info.get("database") == "connected" else "error",
+            **db_info,
+        }
     except Exception as exc:
-        db_status = {"status": "error", "detail": str(exc)}
+        # Keep the response credential-safe: report only the exception class.
+        db_status = {"status": "error", "detail": type(exc).__name__}
 
-    redis_status = await redis_health_check()
-    s3_status = await storage_service.health_check()
+    try:
+        redis_status = await redis_health_check()
+    except Exception as exc:
+        logger.warning("Redis health check raised %s.", type(exc).__name__)
+        redis_status = {"status": "error", "detail": type(exc).__name__}
+
+    try:
+        s3_status = await storage_service.health_check()
+    except Exception as exc:
+        logger.warning("S3 health check raised %s.", type(exc).__name__)
+        s3_status = {"status": "error", "detail": type(exc).__name__}
 
     overall = all(
         svc.get("status") == "ok"

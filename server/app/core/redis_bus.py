@@ -8,6 +8,7 @@ corresponding channel to relay updates to the React client over WebSocket.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -27,6 +28,11 @@ _settings = get_settings()
 redis_client: aioredis.Redis = aioredis.Redis.from_url(
     _settings.REDIS_URL,
     decode_responses=True,
+    # Bounded timeouts prevent /health and startup from hanging when a stopped
+    # container's port is still accepted by the Docker Desktop proxy.
+    socket_connect_timeout=3,
+    socket_timeout=3,
+    retry_on_timeout=False,
 )
 
 # Channel prefix used for WebSocket forwarding
@@ -99,8 +105,8 @@ async def get_json(key: str) -> dict[str, Any] | None:
 async def redis_health_check() -> dict[str, str]:
     """Ping Redis and return a status dict."""
     try:
-        pong: Any = await redis_client.ping()
+        pong: Any = await asyncio.wait_for(redis_client.ping(), timeout=3)
         return {"status": "ok", "ping": str(pong)}
     except Exception as exc:
-        return {"status": "error", "detail": str(exc)}
+        return {"status": "error", "detail": type(exc).__name__}
 

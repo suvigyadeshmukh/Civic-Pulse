@@ -99,6 +99,7 @@ ms-playwright/
 media/
 uploads/
 storage/
+.local_storage/
 *.tmp
 *.log
 celerybeat-schedule

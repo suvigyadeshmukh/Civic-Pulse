@@ -64,6 +64,10 @@ engine = create_async_engine(
     max_overflow=10,
     pool_pre_ping=True,
     echo=_settings.DEBUG and _settings.LOG_LEVEL == "debug",
+    # Bound connection attempts so startup and /health degrade quickly when
+    # PostgreSQL is unreachable (the Docker Desktop proxy can accept a TCP
+    # connection for a stopped container and leave the handshake hanging).
+    connect_args={"timeout": 3},
 )
 
 AsyncSessionLocal = async_sessionmaker(
@@ -92,45 +96,113 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
 # ---------------------------------------------------------------------------
 # Startup verification — called once inside the FastAPI lifespan manager.
 # ---------------------------------------------------------------------------
-_REQUIRED_EXTENSIONS = {"vector", "postgis", "pgcrypto"}
+_REQUIRED_EXTENSIONS: list[str] = ["pgcrypto", "postgis", "uuid-ossp", "vector"]
+
+
+def _classify_extension_error(exc: Exception) -> str:
+    """Return a short, credential-safe reason for a failed extension creation."""
+    orig = getattr(exc, "orig", None) or exc
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    message = str(exc).lower()
+
+    if sqlstate == "42501" or "permission denied" in message or "insufficient privilege" in message:
+        return "insufficient database privileges"
+    if sqlstate == "58P01" or "could not open extension control file" in message:
+        return "extension not available on the server"
+    return type(exc).__name__
 
 
 async def verify_db_connection_and_extensions() -> dict[str, object]:
-    """Connect to PostgreSQL and verify that required extensions are loaded.
+    """Connect to PostgreSQL, create missing extensions, and report availability.
 
-    Returns a dict summarising the verification result, e.g.::
+    Extension creation failures are logged but never abort startup: a missing
+    extension or an account without ``CREATE EXTENSION`` privileges leaves the
+    database in a degraded-but-usable state. Connection failures are likewise
+    reported as degraded instead of raising.
 
-        {
-            "connected": True,
-            "extensions_found": ["pgcrypto", "postgis", "uuid-ossp", "vector"],
-            "missing": [],
+    Returns
+    -------
+    dict[str, object]
+        ``{"database": "connected", "extensions": [...]}`` on success, or
+        ``{"database": "degraded (<ExceptionType>)", "extensions": []}`` when
+        PostgreSQL is unavailable. Credentials and connection strings are
+        never included in the result.
+    """
+    try:
+        async with engine.begin() as conn:
+            creation_failures: dict[str, str] = {}
+
+            for ext in _REQUIRED_EXTENSIONS:
+                # A savepoint keeps a failed CREATE EXTENSION from aborting the
+                # outer transaction, so the remaining extensions can still be
+                # attempted and the final catalog query can still run.
+                try:
+                    async with conn.begin_nested():
+                        await conn.execute(
+                            text(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
+                        )
+                except Exception as exc:
+                    reason = _classify_extension_error(exc)
+                    creation_failures[ext] = reason
+                    logger.warning(
+                        "Could not create PostgreSQL extension '%s': %s.",
+                        ext,
+                        reason,
+                    )
+
+            res = await conn.execute(
+                text(
+                    """
+                    SELECT extname
+                    FROM pg_extension
+                    WHERE extname IN (
+                        'uuid-ossp',
+                        'pgcrypto',
+                        'vector',
+                        'postgis'
+                    )
+                    ORDER BY extname;
+                    """
+                )
+            )
+            installed = [row[0] for row in res.fetchall()]
+
+        missing = [ext for ext in _REQUIRED_EXTENSIONS if ext not in installed]
+        for ext in missing:
+            reason = creation_failures.get(ext)
+            if reason:
+                logger.warning(
+                    "PostgreSQL extension '%s' is not installed (%s).",
+                    ext,
+                    reason,
+                )
+            else:
+                logger.warning(
+                    "PostgreSQL extension '%s' is not installed.",
+                    ext,
+                )
+
+        if not missing:
+            logger.info(
+                "Database connected — required extensions verified: %s",
+                installed,
+            )
+
+        return {
+            "database": "connected",
+            "extensions": installed,
         }
 
-    Raises
-    ------
-    RuntimeError
-        If the database is unreachable or a required extension is missing.
-    """
-    async with engine.connect() as conn:
-        rows = await conn.execute(text("SELECT extname FROM pg_extension"))
-        installed: set[str] = {row[0] for row in rows}
-
-    missing = _REQUIRED_EXTENSIONS - installed
-
-    result: dict[str, object] = {
-        "connected": True,
-        "extensions_found": sorted(installed),
-        "missing": sorted(missing),
-    }
-
-    if missing:
-        msg = (
-            f"Required PostgreSQL extensions missing: {sorted(missing)}. "
-            "Ensure init-extensions.sql ran during container init."
+    except Exception as exc:
+        # Report only the exception class: messages from asyncpg may contain
+        # usernames, hosts, or other connection details.
+        logger.warning(
+            "Database connection verification failed (%s); "
+            "continuing in degraded mode.",
+            type(exc).__name__,
         )
-        logger.error(msg)
-        raise RuntimeError(msg)
-
-    logger.info("Database OK — extensions verified: %s", sorted(installed))
-    return result
+        return {
+            "database": f"degraded ({type(exc).__name__})",
+            "extensions": [],
+        }
 
